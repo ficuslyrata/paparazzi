@@ -23,7 +23,6 @@
 // TODO
 //
 // gravity heuristic
-// gps update for yaw on fixed wing ?
 //
 
 #include "subsystems/ahrs/ahrs_int_cmpl.h"
@@ -31,7 +30,7 @@
 #include "subsystems/ahrs/ahrs_int_utils.h"
 
 #include "subsystems/imu.h"
-#ifdef USE_GPS
+#if USE_GPS
 #include "subsystems/gps.h"
 #endif
 #include "math/pprz_trig_int.h"
@@ -44,6 +43,9 @@
 static inline void ahrs_update_mag_full(void);
 static inline void ahrs_update_mag_2d(void);
 
+#ifdef AHRS_MAG_UPDATE_YAW_ONLY
+#warning "AHRS_MAG_UPDATE_YAW_ONLY is deprecated, please remove it. This is the default behaviour. Define AHRS_MAG_UPDATE_ALL_AXES to use mag for all axes and not only yaw."
+#endif
 
 /* in place quaternion first order integration with constante rotational velocity */
 /*  */
@@ -82,6 +84,7 @@ static inline void compute_body_orientation(void);
 void ahrs_init(void) {
 
   ahrs.status = AHRS_UNINIT;
+  ahrs_impl.ltp_vel_norm_valid = FALSE;
 
   /* set ltp_to_body to zero */
   INT_EULERS_ZERO(ahrs.ltp_to_body_euler);
@@ -98,6 +101,12 @@ void ahrs_init(void) {
   INT_RATES_ZERO(ahrs_impl.gyro_bias);
   INT_RATES_ZERO(ahrs_impl.rate_correction);
   INT_RATES_ZERO(ahrs_impl.high_rez_bias);
+
+#if AHRS_GRAVITY_UPDATE_COORDINATED_TURN
+  ahrs_impl.correct_gravity = TRUE;
+#else
+  ahrs_impl.correct_gravity = FALSE;
+#endif
 
 }
 
@@ -166,37 +175,35 @@ void ahrs_update_accel(void) {
                            RMAT_ELMT(ahrs.ltp_to_imu_rmat, 1,2),
                            RMAT_ELMT(ahrs.ltp_to_imu_rmat, 2,2)};
   struct Int32Vect3 residual;
-#ifdef AHRS_GRAVITY_UPDATE_COORDINATED_TURN
-#ifdef USE_GPS
-  ahrs_impl.ltp_vel_norm = SPEED_BFP_OF_REAL(gps.speed_3d / 100.);
-#endif
-  /*
-   * centrifugal acceleration in body frame
-   * a_c_body = omega x (omega x r)
-   * (omega x r) = tangential velocity in body frame
-   * a_c_body = omega x vel_tangential_body
-   * assumption: tangential velocity only along body x-axis
-   */
 
-  // FIXME: check overflows !
-  const struct Int32Vect3 vel_tangential_body = {(ahrs_impl.ltp_vel_norm>>INT32_ACCEL_FRAC), 0.0, 0.0};
-  struct Int32Vect3 acc_c_body;
-  VECT3_RATES_CROSS_VECT3(acc_c_body, ahrs.body_rate, vel_tangential_body);
-  INT32_VECT3_RSHIFT(acc_c_body, acc_c_body, INT32_SPEED_FRAC+INT32_RATE_FRAC-INT32_ACCEL_FRAC-INT32_ACCEL_FRAC);
+  if (ahrs_impl.correct_gravity && ahrs_impl.ltp_vel_norm_valid) {
+    /*
+     * centrifugal acceleration in body frame
+     * a_c_body = omega x (omega x r)
+     * (omega x r) = tangential velocity in body frame
+     * a_c_body = omega x vel_tangential_body
+     * assumption: tangential velocity only along body x-axis
+     */
 
-  /* convert centrifucal acceleration from body to imu frame */
-  struct Int32Vect3 acc_c_imu;
-  INT32_RMAT_VMULT(acc_c_imu, imu.body_to_imu_rmat, acc_c_body);
+    // FIXME: check overflows !
+    const struct Int32Vect3 vel_tangential_body = {(ahrs_impl.ltp_vel_norm>>INT32_ACCEL_FRAC), 0.0, 0.0};
+    struct Int32Vect3 acc_c_body;
+    VECT3_RATES_CROSS_VECT3(acc_c_body, ahrs.body_rate, vel_tangential_body);
+    INT32_VECT3_RSHIFT(acc_c_body, acc_c_body, INT32_SPEED_FRAC+INT32_RATE_FRAC-INT32_ACCEL_FRAC-INT32_ACCEL_FRAC);
 
-  /* and subtract it from imu measurement to get a corrected measurement of the gravitiy vector */
-  struct Int32Vect3 corrected_gravity;
-  INT32_VECT3_DIFF(corrected_gravity, imu.accel, acc_c_imu);
+    /* convert centrifucal acceleration from body to imu frame */
+    struct Int32Vect3 acc_c_imu;
+    INT32_RMAT_VMULT(acc_c_imu, imu.body_to_imu_rmat, acc_c_body);
 
-  /* compute the residual of gravity vector in imu frame */
-  INT32_VECT3_CROSS_PRODUCT(residual, corrected_gravity, c2);
-#else
-  INT32_VECT3_CROSS_PRODUCT(residual, imu.accel, c2);
-#endif
+    /* and subtract it from imu measurement to get a corrected measurement of the gravitiy vector */
+    struct Int32Vect3 corrected_gravity;
+    INT32_VECT3_DIFF(corrected_gravity, imu.accel, acc_c_imu);
+
+    /* compute the residual of gravity vector in imu frame */
+    INT32_VECT3_CROSS_PRODUCT(residual, corrected_gravity, c2);
+  } else {
+    INT32_VECT3_CROSS_PRODUCT(residual, imu.accel, c2);
+  }
 
   // residual FRAC : ACCEL_FRAC + TRIG_FRAC = 10 + 14 = 24
   // rate_correction FRAC = RATE_FRAC = 12
@@ -225,10 +232,10 @@ void ahrs_update_accel(void) {
 }
 
 void ahrs_update_mag(void) {
-#ifdef AHRS_MAG_UPDATE_YAW_ONLY
-  ahrs_update_mag_2d();
-#else
+#if AHRS_MAG_UPDATE_ALL_AXES
   ahrs_update_mag_full();
+#else
+  ahrs_update_mag_2d();
 #endif
 }
 
@@ -304,6 +311,70 @@ static inline void ahrs_update_mag_2d(void) {
 
 }
 
+void ahrs_update_gps(void) {
+#if AHRS_GRAVITY_UPDATE_COORDINATED_TURN && USE_GPS
+  if (gps.fix == GPS_FIX_3D) {
+    ahrs_impl.ltp_vel_norm = SPEED_BFP_OF_REAL(gps.speed_3d / 100.);
+    ahrs_impl.ltp_vel_norm_valid = TRUE;
+  } else {
+    ahrs_impl.ltp_vel_norm_valid = FALSE;
+  }
+#endif
+
+#if AHRS_USE_GPS_HEADING && USE_GPS
+  //got a 3d fix and ground speed is more than 0.5 m/s
+  if(gps.fix == GPS_FIX_3D && gps.gspeed>= 500) {
+    // gps.course is in rad * 1e7, we need it in rad * 2^INT32_ANGLE_FRAC
+    int32_t course = gps.course * ((1<<INT32_ANGLE_FRAC) / 1e7);
+    ahrs_update_course(course);
+  }
+#endif
+}
+
+/** Update yaw based on a heading measurement.
+ * e.g. from GPS course
+ * @param heading Heading in radians (CW/north) with #INT32_ANGLE_FRAC
+ */
+void ahrs_update_heading(int32_t heading) {
+
+  INT32_ANGLE_NORMALIZE(heading);
+
+  // row 0 of ltp_to_body_rmat = body x-axis in ltp frame
+  // we only consider x and y
+  struct Int32Vect2 expected_ltp =
+    { RMAT_ELMT(ahrs.ltp_to_body_rmat, 0, 0),
+      RMAT_ELMT(ahrs.ltp_to_body_rmat, 0, 1) };
+
+  int32_t heading_x, heading_y;
+  PPRZ_ITRIG_COS(heading_x, heading); // measured course in x-direction
+  PPRZ_ITRIG_SIN(heading_y, heading); // measured course in y-direction
+
+  // expected_heading cross measured_heading ??
+  struct Int32Vect3 residual_ltp =
+    { 0,
+      0,
+      (expected_ltp.x * heading_y - expected_ltp.y * heading_x)/(1<<INT32_ANGLE_FRAC)};
+
+  struct Int32Vect3 residual_imu;
+  INT32_RMAT_VMULT(residual_imu, ahrs.ltp_to_imu_rmat, residual_ltp);
+
+  // residual FRAC = TRIG_FRAC + TRIG_FRAC = 14 + 14 = 28
+  // rate_correction FRAC = RATE_FRAC = 12
+  // 2^12 / 2^28 * 4.0 = 1/2^14
+  // (1<<INT32_ANGLE_FRAC)/2^14 = 1/4
+  ahrs_impl.rate_correction.p += residual_imu.x/4;
+  ahrs_impl.rate_correction.q += residual_imu.y/4;
+  ahrs_impl.rate_correction.r += residual_imu.z/4;
+
+  // residual_ltp FRAC = 2 * TRIG_FRAC = 28
+  // high_rez_bias = RATE_FRAC+28 = 40
+  // 2^40 / 2^28 * 2.5e-4 = 1
+  ahrs_impl.high_rez_bias.p -= residual_imu.x*(1<<INT32_ANGLE_FRAC);
+  ahrs_impl.high_rez_bias.q -= residual_imu.y*(1<<INT32_ANGLE_FRAC);
+  ahrs_impl.high_rez_bias.r -= residual_imu.z*(1<<INT32_ANGLE_FRAC);
+
+  INT_RATES_RSHIFT(ahrs_impl.gyro_bias, ahrs_impl.high_rez_bias, 28);
+}
 
 /* Compute ltp to imu rotation in quaternion and rotation matrice representation
    from the euler angle representation */

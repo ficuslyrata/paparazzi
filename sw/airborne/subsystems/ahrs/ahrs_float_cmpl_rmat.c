@@ -28,7 +28,7 @@
 #include "math/pprz_algebra_int.h"
 #include "math/pprz_simple_matrix.h"
 #include "generated/airframe.h"
-#ifdef USE_GPS
+#if USE_GPS
 #include "subsystems/gps.h"
 #endif
 
@@ -37,6 +37,10 @@
 
 #if !defined AHRS_PROPAGATE_RMAT && !defined AHRS_PROPAGATE_QUAT
 #error "You have to define either AHRS_PROPAGATE_RMAT or AHRS_PROPAGATE_QUAT"
+#endif
+
+#ifdef AHRS_MAG_UPDATE_YAW_ONLY
+#warning "AHRS_MAG_UPDATE_YAW_ONLY is deprecated, please remove it. This is the default behaviour. Define AHRS_MAG_UPDATE_ALL_AXES to use mag for all axes and not only yaw."
 #endif
 
 void ahrs_update_mag_full(void);
@@ -52,6 +56,7 @@ struct AhrsFloatCmplRmat ahrs_impl;
 
 void ahrs_init(void) {
   ahrs.status = AHRS_UNINIT;
+  ahrs_impl.ltp_vel_norm_valid = FALSE;
 
   /* Initialises IMU alignement */
   struct FloatEulers body_to_imu_euler =
@@ -71,6 +76,12 @@ void ahrs_init(void) {
   EULERS_COPY(ahrs_float.ltp_to_imu_euler, body_to_imu_euler);
 
   FLOAT_RATES_ZERO(ahrs_float.imu_rate);
+
+#if AHRS_GRAVITY_UPDATE_COORDINATED_TURN
+  ahrs_impl.correct_gravity = TRUE;
+#else
+  ahrs_impl.correct_gravity = FALSE;
+#endif
 
 }
 
@@ -142,38 +153,36 @@ void ahrs_update_accel(void) {
   ACCELS_FLOAT_OF_BFP(imu_accel_float, imu.accel);
 
   struct FloatVect3 residual;
-#ifdef AHRS_GRAVITY_UPDATE_COORDINATED_TURN
-#ifdef USE_GPS
-  ahrs_impl.ltp_vel_norm = gps.speed_3d / 100.;
-#endif
-  /*
-   * centrifugal acceleration in body frame
-   * a_c_body = omega x (omega x r)
-   * (omega x r) = tangential velocity in body frame
-   * a_c_body = omega x vel_tangential_body
-   * assumption: tangential velocity only along body x-axis
-   */
-  const struct FloatVect3 vel_tangential_body = {ahrs_impl.ltp_vel_norm, 0.0, 0.0};
-  struct FloatVect3 acc_c_body;
-  VECT3_RATES_CROSS_VECT3(acc_c_body, ahrs_float.body_rate, vel_tangential_body);
 
-  /* convert centrifucal acceleration from body to imu frame */
-  struct FloatVect3 acc_c_imu;
-  FLOAT_RMAT_VECT3_MUL(acc_c_imu, ahrs_impl.body_to_imu_rmat, acc_c_body);
+  if (ahrs_impl.correct_gravity && ahrs_impl.ltp_vel_norm_valid) {
+    /*
+     * centrifugal acceleration in body frame
+     * a_c_body = omega x (omega x r)
+     * (omega x r) = tangential velocity in body frame
+     * a_c_body = omega x vel_tangential_body
+     * assumption: tangential velocity only along body x-axis
+     */
+    const struct FloatVect3 vel_tangential_body = {ahrs_impl.ltp_vel_norm, 0.0, 0.0};
+    struct FloatVect3 acc_c_body;
+    VECT3_RATES_CROSS_VECT3(acc_c_body, ahrs_float.body_rate, vel_tangential_body);
 
-  /* and subtract it from imu measurement to get a corrected measurement of the gravitiy vector */
-  struct FloatVect3 corrected_gravity;
-  VECT3_DIFF(corrected_gravity, imu_accel_float, acc_c_imu);
+    /* convert centrifucal acceleration from body to imu frame */
+    struct FloatVect3 acc_c_imu;
+    FLOAT_RMAT_VECT3_MUL(acc_c_imu, ahrs_impl.body_to_imu_rmat, acc_c_body);
 
-  /* compute the residual of gravity vector in imu frame */
-  FLOAT_VECT3_CROSS_PRODUCT(residual, corrected_gravity, c2);
-#else
-  FLOAT_VECT3_CROSS_PRODUCT(residual, imu_accel_float, c2);
-#endif
+    /* and subtract it from imu measurement to get a corrected measurement of the gravitiy vector */
+    struct FloatVect3 corrected_gravity;
+    VECT3_DIFF(corrected_gravity, imu_accel_float, acc_c_imu);
+
+    /* compute the residual of gravity vector in imu frame */
+    FLOAT_VECT3_CROSS_PRODUCT(residual, corrected_gravity, c2);
+  } else {
+    FLOAT_VECT3_CROSS_PRODUCT(residual, imu_accel_float, c2);
+  }
 
 #ifdef AHRS_GRAVITY_UPDATE_NORM_HEURISTIC
   /* heuristic on acceleration norm */
-  const float acc_norm = FLOAT_VECT3_NORM(accel_float);
+  const float acc_norm = FLOAT_VECT3_NORM(imu_accel_float);
   const float weight = Chop(1.-6*fabs((9.81-acc_norm)/9.81), 0., 1.);
 #else
   const float weight = 1.;
@@ -182,25 +191,20 @@ void ahrs_update_accel(void) {
   /* compute correction */
   const float gravity_rate_update_gain = -5e-2; // -5e-2
   FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.rate_correction, residual, weight*gravity_rate_update_gain);
-#if 1
+
   const float gravity_bias_update_gain = 1e-5; // -5e-6
   FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.gyro_bias, residual, weight*gravity_bias_update_gain);
-#else
-  const float alpha = 5e-4;
-  FLOAT_RATES_SCALE(ahrs_impl.gyro_bias, 1.-alpha);
-  FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.gyro_bias, residual, alpha);
-#endif
+
   /* FIXME: saturate bias */
 
 }
 
 
 void ahrs_update_mag(void) {
-#ifdef AHRS_MAG_UPDATE_YAW_ONLY
-  ahrs_update_mag_2d();
-  //  ahrs_update_mag_2d_dumb();
-#else
+#if AHRS_MAG_UPDATE_ALL_AXES
   ahrs_update_mag_full();
+#else
+  ahrs_update_mag_2d();
 #endif
 }
 
@@ -276,6 +280,57 @@ void ahrs_update_mag_2d_dumb(void) {
   const float mag_bias_update_gain = -2.5e-4;
   FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.gyro_bias, r2, (mag_bias_update_gain*res_norm));
 
+}
+
+void ahrs_update_gps(void) {
+#if AHRS_GRAVITY_UPDATE_COORDINATED_TURN && USE_GPS
+  if (gps.fix == GPS_FIX_3D) {
+    ahrs_impl.ltp_vel_norm = gps.speed_3d / 100.;
+    ahrs_impl.ltp_vel_norm_valid = TRUE;
+  } else {
+    ahrs_impl.ltp_vel_norm_valid = FALSE;
+  }
+#endif
+
+#if AHRS_USE_GPS_HEADING && USE_GPS
+  //got a 3d fix and ground speed is more than 0.5 m/s
+  if(gps.fix == GPS_FIX_3D && gps.gspeed>= 500) {
+    // gps.course is in rad * 1e7, we need it in rad
+    float course = gps.course / 1e7;
+    ahrs_update_course(course);
+  }
+#endif
+}
+
+
+/** Update yaw based on a heading measurement.
+ * e.g. from GPS course
+ * @param heading Heading in radians (CW/north)
+ */
+void ahrs_update_heading(float heading) {
+
+  FLOAT_ANGLE_NORMALIZE(heading);
+
+  // row 0 of ltp_to_body_rmat = body x-axis in ltp frame
+  // we only consider x and y
+  struct FloatVect2 expected_ltp =
+    { RMAT_ELMT(ahrs_float.ltp_to_body_rmat, 0, 0),
+      RMAT_ELMT(ahrs_float.ltp_to_body_rmat, 0, 1) };
+
+  // expected_heading cross measured_heading
+  struct FloatVect3 residual_ltp =
+    { 0,
+      0,
+      expected_ltp.x * sinf(heading) - expected_ltp.y * cosf(heading)};
+
+  struct FloatVect3 residual_imu;
+  FLOAT_RMAT_VECT3_MUL(residual_imu, ahrs_float.ltp_to_imu_rmat, residual_ltp);
+
+  const float heading_rate_update_gain = 2.5;
+  FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.rate_correction, residual_imu, heading_rate_update_gain);
+
+  const float mag_bias_update_gain = -2.5e-4;
+  FLOAT_RATES_ADD_SCALED_VECT(ahrs_impl.gyro_bias, residual_imu, mag_bias_update_gain);
 }
 
 

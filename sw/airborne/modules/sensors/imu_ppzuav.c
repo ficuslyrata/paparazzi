@@ -73,10 +73,10 @@ void imu_impl_init(void)
 #if PERIODIC_FREQUENCY == 60
   /* set gyro range to 2000deg/s and low pass at 20Hz (< 60Hz/2) internal sampling at 1kHz */
   ppzuavimu_itg3200.buf[1] = (0x03<<3) | (0x04<<0);
-#  warning Info: ITG3200 read at 50Hz
+#  pragma message "ITG3200 read at 50Hz."
 #else
 #  if PERIODIC_FREQUENCY == 120
-#  warning Info: ITG3200 read at 100Hz
+#  pragma message "ITG3200 read at 100Hz."
   /* set gyro range to 2000deg/s and low pass at 42Hz (< 120Hz/2) internal sampling at 1kHz */
   ppzuavimu_itg3200.buf[1] = (0x03<<3) | (0x03<<0);
 #  else
@@ -200,9 +200,9 @@ void imu_periodic( void )
 
 void ppzuavimu_module_downlink_raw( void )
 {
-  DOWNLINK_SEND_IMU_GYRO_RAW(DefaultChannel,&imu.gyro_unscaled.p,&imu.gyro_unscaled.q,&imu.gyro_unscaled.r);
-  DOWNLINK_SEND_IMU_ACCEL_RAW(DefaultChannel,&imu.accel_unscaled.x,&imu.accel_unscaled.y,&imu.accel_unscaled.z);
-  DOWNLINK_SEND_IMU_MAG_RAW(DefaultChannel,&imu.mag_unscaled.x,&imu.mag_unscaled.y,&imu.mag_unscaled.z);
+  DOWNLINK_SEND_IMU_GYRO_RAW(DefaultChannel, DefaultDevice,&imu.gyro_unscaled.p,&imu.gyro_unscaled.q,&imu.gyro_unscaled.r);
+  DOWNLINK_SEND_IMU_ACCEL_RAW(DefaultChannel, DefaultDevice,&imu.accel_unscaled.x,&imu.accel_unscaled.y,&imu.accel_unscaled.z);
+  DOWNLINK_SEND_IMU_MAG_RAW(DefaultChannel, DefaultDevice,&imu.mag_unscaled.x,&imu.mag_unscaled.y,&imu.mag_unscaled.z);
 }
 
 void ppzuavimu_module_event( void )
